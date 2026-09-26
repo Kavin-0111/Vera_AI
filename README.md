@@ -1,103 +1,83 @@
 # Vera-replacement bot — magicpin AI Challenge
 
-## Approach
+## Project Details
 
-A single FastAPI service implementing the 5-endpoint contract
-(`/v1/context`, `/v1/tick`, `/v1/reply`, `/v1/healthz`, `/v1/metadata`).
+A single FastAPI service implementing the 5-endpoint contract (`/v1/context`, `/v1/tick`, `/v1/reply`, `/v1/healthz`, `/v1/metadata`).
 
-The composer (`compose()` in `bot.py`) is one function that takes the four
-context layers (category, merchant, trigger, customer?) and produces a
-message via a large language model at `temperature=0`, guided by a system
-prompt that encodes the brief's rubric directly: specificity, category-voice
-fit, merchant personalization, trigger relevance, and engagement-compulsion
-levers (with an explicit nudge toward the underused "social proof" and
-"ask the merchant a question" levers called out in the brief).
+The composer (`compose()` in `bot.py`) is one function that takes the four context layers (category, merchant, trigger, customer?) and produces a message via a large language model at `temperature=0`. It is guided by a system prompt that encodes the brief's rubric directly: specificity, category-voice fit, merchant personalization, trigger relevance, and engagement-compulsion levers.
 
-If no `LLM_API_KEY` is set, the bot falls back to deterministic
-rule-based templates per trigger kind, so the service still runs
-end-to-end (lower quality, but never crashes or times out).
+**Recent PRD Upgrades Implemented:**
+- **FR-12 & NFR-3 (Timeout & Async):** `compose()` runs asynchronously in a ThreadPoolExecutor with a hard 25-second timeout, ensuring the bot never exceeds the 30s judge limit.
+- **FR-18 (Hostile/Off-topic Handling):** Fully implemented hostile language and off-topic redirect loops.
+- **NFR-5 (Action Limits):** Hard cap of 20 actions per `/v1/tick` implemented.
+- **FR-1 (Idempotency):** Strict versioning handling on `/v1/context` (returns 200 for same version, 409 for stale version).
+- **C-1 (WhatsApp Sessions):** Enforces template matching only on the first outbound message.
 
-## Multi-turn handling (`/v1/reply`)
+## Team Info
+- **Team Name:** Kavin
+- **Team Members:** Kavin Mathur
+- **Contact Email:** kavin.mathur.ug23@nsut.ac.in
 
-- **Auto-reply detection**: matches canned-reply phrase patterns (English +
-  Hindi) and also treats an exact-repeat of a prior message from the same
-  role as a signal. First hit -> one low-friction binary retry. Second hit
-  -> graceful `end` (per the brief's "auto-reply pollution" pain point:
-  don't burn multiple turns on a bot).
-- **Intent detection**: explicit positive ("yes"/"go ahead"/"chalega")
-  routes straight to `action mode` instead of re-qualifying (avoids the
-  brief's Pattern D anti-pattern). Explicit negative ends the conversation
-  immediately.
-- **Neutral turns**: routed back through the LLM with the running
-  conversation + contexts, or a safe fallback if no LLM is configured.
-  Conversations auto-exit after 6 turns with no clear signal.
+## Deployment
 
-## Anti-repetition
+The bot is actively deployed using **Docker** on **Render's Free Tier**, powered by the **Google Gemini 2.0 Flash** API.
 
-Every body sent to a given merchant is tracked in-memory
-(`SENT_BODIES`); an exact repeat is nudged before sending, per the
-testing brief's `-2 per repeat` penalty.
+- **Base Deployment URL:** `https://vera-ai-bot-obtb.onrender.com`
+- **LLM Provider:** Google Gemini (`gemini-2.0-flash`)
+- **Hosting:** Render (Docker Runtime)
 
-## Suppression
+> **⚠️ Note on Render Free Tier:** Render spins down inactive free instances after 15 minutes. To avoid disqualification from a cold-start timeout during judging, a ping service (like UptimeRobot) should be configured to hit the `/v1/healthz` endpoint every 5 minutes during the active testing window.
 
-`suppression_key` from each trigger is logged on first use and won't
-fire again in `/v1/tick` for the same key — avoids re-notifying on the
-same event.
+## Endpoints to Test
 
-## Tradeoffs
+You can verify the active deployment using the following endpoints. 
 
-- In-memory state only (no Redis/DB) — fine for a single 60-minute test
-  window per the brief, would need persistence for production.
-- The rule-based fallback composer covers only the trigger kinds seen in
-  the sample dataset; an LLM key is required to handle arbitrary/novel
-  trigger kinds well.
-- No embedding-based retrieval over `digest`/`patient_content_library` —
-  the full category context is passed to the LLM directly (context sizes
-  in the dataset are small enough that this is simpler and just as
-  accurate for this scale).
+**GET Endpoints (Clickable in browser):**
+1. **Health Check:** [https://vera-ai-bot-obtb.onrender.com/v1/healthz](https://vera-ai-bot-obtb.onrender.com/v1/healthz)
+   - *Expected:* `{"status": "ok", "uptime_seconds": ... }`
+2. **Metadata:** [https://vera-ai-bot-obtb.onrender.com/v1/metadata](https://vera-ai-bot-obtb.onrender.com/v1/metadata)
+   - *Expected:* JSON containing the Team Name, Members, and Bot Version (`0.2.0`).
 
-## What additional context would have helped
+**POST Endpoints (Requires curl or Postman):**
 
-- Ground-truth "good message" examples per trigger kind (beyond the two
-  in the brief's appendix) would have let us tune the rule-based fallback
-  more precisely.
-- A recommended maximum reply latency budget per turn (we assume the
-  stated 30s hard limit is also the target, not just the cutoff).
-
-## Running locally
-
-No LLM provider name is hardcoded anywhere in `bot.py` — all provider
-specifics are supplied via environment variables, which stay private to
-your deployment and are never echoed back in any API response
-(`/v1/metadata` reports a generic `"proprietary-composer-v1"` /
-`"rule-based-fallback"` label instead of a model name).
-
+3. **Push Context (`/v1/context`)**
 ```bash
-pip install -r requirements.txt
-
-# Optional — omit all of these to run on the deterministic rule-based
-# fallback composer instead of an LLM:
-export LLM_API_KEY=...
-export LLM_API_BASE=https://your-llm-provider.example.com/v1   # your provider's base URL
-export LLM_MODEL=your-model-id                                 # your provider's model id
-export LLM_AUTH_HEADER=x-api-key                    # header name your provider expects
-export LLM_AUTH_PREFIX=""                           # e.g. "Bearer " for some providers
-export LLM_EXTRA_HEADERS_JSON='{}'                  # any extra headers your provider requires
-
-export TEAM_NAME="Your Team"
-export TEAM_MEMBERS="Alice,Bob"
-export CONTACT_EMAIL="you@example.com"
-uvicorn bot:app --host 0.0.0.0 --port 8080
+curl -X POST https://vera-ai-bot-obtb.onrender.com/v1/context \
+-H "Content-Type: application/json" \
+-d '{
+  "scope": "merchant",
+  "context_id": "merch_123",
+  "version": 1,
+  "payload": {"identity": {"name": "Test Salon"}},
+  "delivered_at": "2026-09-26T10:00:00Z"
+}'
 ```
 
-Then, from the challenge zip's root, run the provided simulator against it:
-
+4. **Tick (`/v1/tick`)**
 ```bash
-export BOT_URL=http://localhost:8080
-python judge_simulator.py
+curl -X POST https://vera-ai-bot-obtb.onrender.com/v1/tick \
+-H "Content-Type: application/json" \
+-d '{
+  "now": "2026-09-26T10:00:00Z",
+  "available_triggers": []
+}'
 ```
 
-## Deploying
+## Running Locally
 
-`Dockerfile` included — deploy to Render / Railway / Fly.io / Cloud Run,
-set the same env vars, and submit the resulting public HTTPS URL.
+No LLM provider name is hardcoded anywhere in `bot.py` — all provider specifics are supplied via environment variables.
+
+1. Ensure you have your `.env` file configured with your Gemini API key (see `.env` for the template, this file is intentionally git-ignored).
+2. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+3. Run the FastAPI server:
+   ```bash
+   uvicorn bot:app --host 0.0.0.0 --port 8080
+   ```
+4. Run the provided simulator from the challenge root:
+   ```bash
+   export BOT_URL=http://localhost:8080
+   python judge_simulator.py
+   ```
