@@ -6,21 +6,72 @@ A high-performance, stateless conversational agent built for the magicpin mercha
 
 Vera is built as a single-binary FastAPI service exposing a stateful, robust HTTP contract.
 
-```mermaid
-graph TD
-    A[magicpin Judge/Webhook] -->|HTTP POST| B(FastAPI Server)
-    B -->|Context/Triggers| C{In-Memory State Store}
-    B -->|Active Conversations| C
-    B --> D[Compose Engine]
-    C -->|Hydrate Context| D
-    D -->|System Prompt + Payload| E[Google Gemini 2.0 Flash]
-    E -->|JSON Response| D
-    D -->|Action: Send/Wait/End| B
-    B -->|JSON Response| A
+```text
+                         ┌──────────────────────────┐
+                         │   magicpin Judge/Webhook  │
+                         └────────────┬─────────────┘
+                                      │ HTTP POST
+                                      ▼
+                         ┌──────────────────────────┐
+                         │      FastAPI Service      │
+                         └────────────┬─────────────┘
+                                      │
+                 ┌────────────────────┼────────────────────┐
+                 │                    │                    │
+                 ▼                    ▼                    ▼
+        ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
+        │ /v1/context     │  │ /v1/tick        │  │ /v1/reply       │
+        │ Context Ingest  │  │ Trigger Engine  │  │ Conversation    │
+        │                 │  │                 │  │ Manager         │
+        └────────┬────────┘  └────────┬────────┘  └────────┬────────┘
+                 │                    │                    │
+                 └────────────────────┼────────────────────┘
+                                      ▼
+                         ┌──────────────────────────┐
+                         │      Context Store       │
+                         │                          │
+                         │ • Category Context      │
+                         │ • Merchant Context      │
+                         │ • Trigger Context       │
+                         │ • Customer Context      │
+                         │ • Conversation State     │
+                         └────────────┬─────────────┘
+                                      │ Hydrated Context
+                                      ▼
+                         ┌──────────────────────────┐
+                         │      Compose Engine      │
+                         │                          │
+                         │ System Prompt + Context │
+                         │ + User/Trigger Payload  │
+                         └────────────┬─────────────┘
+                                      │
+                                      ▼
+                         ┌──────────────────────────┐
+                         │ Google Gemini 2.0 Flash  │
+                         │                          │
+                         │      LLM Response        │
+                         └────────────┬─────────────┘
+                                      │
+                                      ▼
+                         ┌──────────────────────────┐
+                         │      Action Router       │
+                         │                          │
+                         │    Send / Wait / End     │
+                         └────────────┬─────────────┘
+                                      │
+                                      ▼
+                         ┌──────────────────────────┐
+                         │      FastAPI Service      │
+                         └────────────┬─────────────┘
+                                      │ JSON Response
+                                      ▼
+                         ┌──────────────────────────┐
+                         │   magicpin Judge/Webhook  │
+                         └──────────────────────────┘
 ```
 
-
 The core conversational engine (`compose()`) utilizes a deterministic multi-context pipeline. It ingests four layers of context (category, merchant, trigger, customer) and synthesizes localized, highly personalized responses using Google's Gemini LLM. The engine is tuned via a strict rubric-derived system prompt ensuring:
+
 - **High Specificity:** Anchoring on concrete metrics and active merchant catalogs.
 - **Brand Consistency:** Maintaining category-specific tone while respecting strict negative vocabularies.
 - **Engagement Optimization:** Utilizing behavioral levers like social proof and open-ended curiosity hooks.
@@ -34,6 +85,7 @@ The core conversational engine (`compose()`) utilizes a deterministic multi-cont
 - **WhatsApp Template Compliance:** Differentiates between initial session-opening templated dispatches and subsequent free-form replies (24h rule).
 
 ## Team Information
+
 - **Team Name:** Kavin
 - **Team Members:** Kavin Mathur
 - **Contact Email:** kavin.mathur.ug23@nsut.ac.in
@@ -59,31 +111,37 @@ The service is currently deployed as a containerized workload using Docker.
 ## Local Development
 
 ### Prerequisites
+
 - Python 3.11+
 - Docker (optional, for containerized deployment)
 - Google Gemini API Key (get one free at [Google AI Studio](https://aistudio.google.com/apikey))
 
 ### Setup
+
 The service is designed to be provider-agnostic. All secrets and provider configurations are injected via the environment.
 
 1. Configure `.env` with valid LLM credentials (see `.env.example` if applicable).
 2. Install dependencies:
+
    ```bash
    pip install -r requirements.txt
    ```
+
 3. Initialize the server:
+
    ```bash
    uvicorn bot:app --host 0.0.0.0 --port 8080
    ```
 
 ### Local Testing (Simulator)
+
 To test the bot locally using the challenge's provided `judge_simulator.py`:
 
 1. Ensure the FastAPI server is running in one terminal window.
 2. In a second terminal window, navigate to the challenge root directory.
 3. Export the target URL and run the simulator:
+
    ```bash
    export BOT_URL=http://localhost:8080
    python judge_simulator.py
    ```
-
