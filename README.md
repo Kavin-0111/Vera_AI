@@ -7,13 +7,13 @@ A single FastAPI service implementing the 5-endpoint contract
 
 The composer (`compose()` in `bot.py`) is one function that takes the four
 context layers (category, merchant, trigger, customer?) and produces a
-message via Claude at `temperature=0`, guided by a system prompt that
-encodes the brief's rubric directly: specificity, category-voice fit,
-merchant personalization, trigger relevance, and engagement-compulsion
+message via a large language model at `temperature=0`, guided by a system
+prompt that encodes the brief's rubric directly: specificity, category-voice
+fit, merchant personalization, trigger relevance, and engagement-compulsion
 levers (with an explicit nudge toward the underused "social proof" and
 "ask the merchant a question" levers called out in the brief).
 
-If no `ANTHROPIC_API_KEY` is set, the bot falls back to deterministic
+If no `LLM_API_KEY` is set, the bot falls back to deterministic
 rule-based templates per trigger kind, so the service still runs
 end-to-end (lower quality, but never crashes or times out).
 
@@ -78,11 +78,11 @@ pip install -r requirements.txt
 # Optional — omit all of these to run on the deterministic rule-based
 # fallback composer instead of an LLM:
 export LLM_API_KEY=...
-export LLM_API_BASE=https://api.anthropic.com/v1   # or your provider's base URL
-export LLM_MODEL=claude-sonnet-4-5-20250929         # or your provider's model id
+export LLM_API_BASE=https://your-llm-provider.example.com/v1   # your provider's base URL
+export LLM_MODEL=your-model-id                                 # your provider's model id
 export LLM_AUTH_HEADER=x-api-key                    # header name your provider expects
-export LLM_AUTH_PREFIX=""                           # e.g. "Bearer " for OpenAI-style providers
-export LLM_EXTRA_HEADERS_JSON='{"anthropic-version":"2023-06-01"}'  # any extra required headers
+export LLM_AUTH_PREFIX=""                           # e.g. "Bearer " for some providers
+export LLM_EXTRA_HEADERS_JSON='{}'                  # any extra headers your provider requires
 
 export TEAM_NAME="Your Team"
 export TEAM_MEMBERS="Alice,Bob"
