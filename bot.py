@@ -26,12 +26,13 @@ import os
 import re
 import json
 import time
-import hashlib
+import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from typing import Any, Optional, Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 logging.basicConfig(level=logging.INFO)
@@ -55,7 +56,13 @@ LLM_API_BASE = os.environ.get("LLM_API_BASE", "")          # e.g. a provider's m
 LLM_AUTH_HEADER = os.environ.get("LLM_AUTH_HEADER", "Authorization")
 LLM_AUTH_PREFIX = os.environ.get("LLM_AUTH_PREFIX", "Bearer ")  # some providers use "" or "Bearer "
 LLM_EXTRA_HEADERS_JSON = os.environ.get("LLM_EXTRA_HEADERS_JSON", "{}")  # e.g. version headers
-BOT_VERSION = "0.1.0"
+BOT_VERSION = "0.2.0"
+COMPOSE_TIMEOUT_S = 25.0   # hard budget per FR-12; 5s buffer below the 30s judge limit
+MAX_TICK_ACTIONS = 20      # per NFR-5
+MAX_CONTEXT_BYTES = 500_000  # per NFR-4
+
+# Thread pool for running synchronous compose() without blocking the async event loop (NFR-3)
+_executor = ThreadPoolExecutor(max_workers=4)
 
 import httpx
 _llm_client: Optional["httpx.Client"] = None
@@ -84,8 +91,8 @@ CONVERSATIONS: dict[str, dict] = {}
 # suppression_key -> last_sent_at (ISO str) — simple in-window dedup
 SUPPRESSION_LOG: dict[str, str] = {}
 
-# merchant_id -> set of bodies already sent (anti-repetition, per §11 penalty)
-SENT_BODIES: dict[str, set[str]] = {}
+# merchant_id -> list of bodies already sent in insertion order (anti-repetition, per §11 penalty)
+SENT_BODIES: dict[str, list[str]] = {}
 
 app = FastAPI(title="Vera-replacement bot")
 
@@ -186,6 +193,34 @@ def detect_intent(message: str) -> Literal["positive", "negative", "neutral"]:
     if any(p in norm for p in POSITIVE_INTENT):
         return "positive"
     return "neutral"
+
+
+# ----------------------------------------------------------------------------
+# Off-topic / hostile detection (FR-18 — Phase 4 "Hostile/off-topic" scenario)
+# ----------------------------------------------------------------------------
+
+# Signals that the message is hostile/abusive — handle firmly but politely
+HOSTILE_SIGNALS = [
+    "shut up", "stupid", "idiot", "bakwaas", "bekar", "waste",
+    "useless", "chutiya", "bc", "mc", "sala", "saala",
+]
+
+# Signals that the message is off-topic (outside Vera's scope)
+OFF_TOPIC_SIGNALS = [
+    "gst", "income tax", "ration card", "police", "court", "fir",
+    "loan", "insurance", "kyc", "passport", "aadhar", "pf", "epf",
+    "mutual fund", "stock market", "crypto",
+]
+
+
+def is_hostile(message: str) -> bool:
+    norm = message.strip().lower()
+    return any(h in norm for h in HOSTILE_SIGNALS)
+
+
+def is_off_topic(message: str) -> bool:
+    norm = message.strip().lower()
+    return any(o in norm for o in OFF_TOPIC_SIGNALS)
 
 
 # ----------------------------------------------------------------------------
@@ -290,25 +325,40 @@ LLM_API_PATH = os.environ.get("LLM_API_PATH", "/messages")
 def _call_llm(system: str, user: str) -> Optional[str]:
     if not _llm_client:
         return None
-    try:
-        resp = _llm_client.post(LLM_API_PATH, json={
-            "model": MODEL_NAME,
-            "max_tokens": 600,
-            "temperature": 0,
-            "system": system,
-            "messages": [{"role": "user", "content": user}],
-        })
-        resp.raise_for_status()
-        data = resp.json()
-        # Works for both a "content: [{type, text}]" shape and a plain "text" field.
-        if isinstance(data.get("content"), list):
-            text = "".join(b.get("text", "") for b in data["content"] if b.get("type") == "text")
-        else:
-            text = data.get("text", "") or data.get("output_text", "")
-        return text.strip()
-    except Exception as e:
-        log.warning("LLM call failed, falling back to rule-based composer: %s", e)
-        return None
+    payload = {
+        "model": MODEL_NAME,
+        "max_tokens": 600,
+        "temperature": 0,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
+        ],
+    }
+    for attempt in range(2):  # one retry for transient 429 / 503
+        try:
+            resp = _llm_client.post(LLM_API_PATH, json=payload)
+            # Gemini free tier returns 429 on rate-limit; back off and retry once
+            if resp.status_code == 429 and attempt == 0:
+                log.warning("LLM returned 429 (rate-limited); retrying after 2s...")
+                time.sleep(2)
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            text = ""
+            # Shape 1: OpenAI / Gemini → choices[0].message.content
+            if data.get("choices"):
+                text = data["choices"][0].get("message", {}).get("content", "")
+            # Shape 2: Anthropic native → content[{type,text}]
+            elif isinstance(data.get("content"), list):
+                text = "".join(b.get("text", "") for b in data["content"] if b.get("type") == "text")
+            # Shape 3: plain text field fallback
+            else:
+                text = data.get("text", "") or data.get("output_text", "")
+            return text.strip() or None
+        except Exception as e:
+            log.warning("LLM call failed (attempt %d), falling back to rule-based composer: %s", attempt + 1, e)
+            break
+    return None
 
 
 def _parse_llm_json(text: str) -> Optional[dict]:
@@ -322,6 +372,22 @@ def _parse_llm_json(text: str) -> Optional[dict]:
     except Exception:
         pass
     return None
+
+
+def _pct(raw: float) -> float:
+    """Normalise a fractional (0.35) or whole-number (35) percentage to a display value."""
+    return raw if abs(raw) > 1 else raw * 100
+
+
+def _apply_vocab_taboo_guard(body: str, category: dict) -> str:
+    """Strip or warn about taboo words in fallback-composed bodies (Rule 2)."""
+    taboo = (category.get("voice") or {}).get("vocab_taboo", [])
+    for word in taboo:
+        if word.lower() in body.lower():
+            log.warning("vocab_taboo word '%s' found in rule-based fallback body — removing.", word)
+            # Replace with empty string; not ideal but safe
+            body = re.sub(re.escape(word), "", body, flags=re.IGNORECASE).strip()
+    return body
 
 
 def _rule_based_compose(category: dict, merchant: dict, trigger: dict,
@@ -340,40 +406,74 @@ def _rule_based_compose(category: dict, merchant: dict, trigger: dict,
         cust_name = customer.get("identity", {}).get("name", "there")
         offers = [o for o in merchant.get("offers", []) if o.get("status") == "active"]
         offer_line = offers[0]["title"] if offers else "our latest offer"
-        body = (f"Hi {cust_name}, this is {merchant.get('identity', {}).get('name')}. "
-                f"It's been a while since your last visit — {offer_line} is available this week. "
-                f"Reply YES to book, or tell us a time that works.")
+        if hindi:
+            body = (f"Hi {cust_name}! {merchant.get('identity', {}).get('name')} ki taraf se — "
+                    f"aapki last visit ke baad kaafi time ho gaya. Is hafte {offer_line} available hai. "
+                    f"Book karne ke liye YES reply karein, ya apna time batayein.")
+        else:
+            body = (f"Hi {cust_name}, this is {merchant.get('identity', {}).get('name')}. "
+                    f"It's been a while since your last visit — {offer_line} is available this week. "
+                    f"Reply YES to book, or tell us a time that works.")
+        body = _apply_vocab_taboo_guard(body, category)
         return {"body": body, "cta": "binary_yes_no",
                 "rationale": "Fallback template: customer recall nudge using active offer and binary CTA."}
 
     if kind == "research_digest" and category.get("digest"):
         item = category["digest"][0]
-        body = (f"{salutation}, {item.get('source', 'a recent industry item')} — "
-                f"{item.get('title', 'a relevant finding')}. Worth a look. "
-                f"Want me to pull the details and draft something you can share?")
+        if hindi:
+            body = (f"{salutation}, {item.get('source', 'ek industry source')} se ek finding hai — "
+                    f"{item.get('title', 'relevant update')}. Kya main details pull karke aapke liye "
+                    f"kuch draft karun?")
+        else:
+            body = (f"{salutation}, {item.get('source', 'a recent industry item')} — "
+                    f"{item.get('title', 'a relevant finding')}. Worth a look. "
+                    f"Want me to pull the details and draft something you can share?")
+        body = _apply_vocab_taboo_guard(body, category)
         return {"body": body, "cta": "open_ended",
                 "rationale": "Fallback template: research digest with source citation and curiosity CTA."}
 
     if kind == "perf_dip":
         perf = merchant.get("performance", {})
         delta = perf.get("delta_7d", {}).get("calls_pct")
-        body = (f"{salutation}, calls dipped {abs(delta)*100:.0f}% this week vs your usual. "
-                f"Want me to check what changed and suggest one fix?") if delta else \
-               f"{salutation}, noticed a dip in activity this week. Want me to take a look?"
+        if delta:
+            pct = _pct(abs(delta))
+            if hindi:
+                body = f"{salutation}, is hafte calls {pct:.0f}% kam aayi hain normal se. Kya main check karun kya hua aur ek fix suggest karun?"
+            else:
+                body = f"{salutation}, calls dipped {pct:.0f}% this week vs your usual. Want me to check what changed and suggest one fix?"
+        else:
+            if hindi:
+                body = f"{salutation}, is hafte activity thodi kam dikhi. Kya main ek nazar daalu?"
+            else:
+                body = f"{salutation}, noticed a dip in activity this week. Want me to take a look?"
+        body = _apply_vocab_taboo_guard(body, category)
         return {"body": body, "cta": "open_ended",
                 "rationale": "Fallback template: performance dip with loss-aversion framing."}
 
     if kind == "perf_spike":
         perf = merchant.get("performance", {})
         delta = perf.get("delta_7d", {}).get("views_pct")
-        body = (f"{salutation}, views are up {delta*100:.0f}% this week. "
-                f"Good time to post an offer while demand's hot — want me to draft one?") if delta else \
-               f"{salutation}, your listing's getting extra attention this week — want to capitalize on it?"
+        if delta:
+            pct = _pct(delta)
+            if hindi:
+                body = f"{salutation}, is hafte views {pct:.0f}% upar hain. Demand hot hai — kya main abhi ek offer draft karun?"
+            else:
+                body = f"{salutation}, views are up {pct:.0f}% this week. Good time to post an offer while demand's hot — want me to draft one?"
+        else:
+            if hindi:
+                body = f"{salutation}, aapki listing ko is hafte extra attention mil rahi hai — capitalize karna chahenge?"
+            else:
+                body = f"{salutation}, your listing's getting extra attention this week — want to capitalize on it?"
+        body = _apply_vocab_taboo_guard(body, category)
         return {"body": body, "cta": "open_ended",
                 "rationale": "Fallback template: performance spike, effort externalization CTA."}
 
     # generic fallback
-    body = f"{salutation}, quick update on your listing — want me to walk you through it?"
+    if hindi:
+        body = f"{salutation}, aapki listing ka ek update hai — kya main walk-through karaun?"
+    else:
+        body = f"{salutation}, quick update on your listing — want me to walk you through it?"
+    body = _apply_vocab_taboo_guard(body, category)
     return {"body": body, "cta": "open_ended",
             "rationale": "Generic fallback template — no specific trigger handler matched."}
 
@@ -385,7 +485,7 @@ def compose(category: dict, merchant: dict, trigger: dict,
     Returns dict with: body, cta, send_as, suppression_key, rationale.
     """
     merchant_id = merchant.get("merchant_id", "unknown")
-    prior_bodies = sorted(SENT_BODIES.get(merchant_id, set()))
+    prior_bodies = list(SENT_BODIES.get(merchant_id, []))
 
     result = None
     if _llm_client:
@@ -403,11 +503,14 @@ def compose(category: dict, merchant: dict, trigger: dict,
 
     # Anti-repetition guard: if identical to something already sent, tweak slightly
     # and flag it in the rationale rather than silently resending verbatim.
-    if body in SENT_BODIES.get(merchant_id, set()):
+    if body in SENT_BODIES.get(merchant_id, []):
         body = body.rstrip(".") + " (following up)."
         rationale = (rationale + " [anti-repetition guard triggered]").strip()
 
-    SENT_BODIES.setdefault(merchant_id, set()).add(body)
+    sent = SENT_BODIES.setdefault(merchant_id, [])
+    sent.append(body)
+    if len(sent) > 50:  # cap memory growth
+        sent.pop(0)
 
     return {
         "body": body,
@@ -446,18 +549,30 @@ def compose_reply(conversation_id: str, merchant_id: Optional[str],
 
     convo["turns"].append({"from_role": from_role, "message": message, "turn": turn_number})
 
-    # 2. Intent detection
+    # 2. Hostile message check (FR-18) — handle firmly before intent detection
+    if is_hostile(message):
+        return {"action": "send",
+                "body": "Noted — I'll keep things focused on what I'm here for: helping with your magicpin listing. Want to continue from where we left off?",
+                "cta": "binary_yes_no",
+                "rationale": "Hostile message detected; politely steering back to mission without abandoning it (FR-18)."}
+
+    # 3. Off-topic check (FR-18) — redirect without dropping the conversation
+    if is_off_topic(message):
+        return {"action": "send",
+                "body": "That's outside what I can help with right now — but on your listing side, I still have something useful lined up. Want to hear it?",
+                "cta": "binary_yes_no",
+                "rationale": "Off-topic message detected; redirecting politely back to scope (FR-18)."}
+
+    # 4. Intent detection
     intent = detect_intent(message)
 
     if intent == "negative":
-        body = None
         return {"action": "end",
                 "rationale": "Merchant/customer signaled not interested or asked to stop; "
                               "exiting immediately without further nudges."}
 
     if intent == "positive":
         merchant = get_ctx("merchant", merchant_id) if merchant_id else None
-        category = get_category_for_merchant(merchant) if merchant else None
         name = (merchant or {}).get("identity", {}).get("name", "there")
         body = f"Great — proceeding now for {name}. I'll confirm here once it's done."
         return {"action": "send", "body": body, "cta": "none",
@@ -465,11 +580,16 @@ def compose_reply(conversation_id: str, merchant_id: Optional[str],
                               "routing straight to action instead of re-qualifying "
                               "(brief §9 Pattern D anti-pattern avoided)."}
 
-    # 3. Neutral / open question — try a real LLM compose using conversation as extra trigger-ish
-    # context; fall back to a safe generic continuation.
+    # 5. Neutral / open question — try a real LLM reply using conversation history.
     merchant = get_ctx("merchant", merchant_id) if merchant_id else None
     customer = get_ctx("customer", customer_id) if customer_id else None
     category = get_category_for_merchant(merchant) if merchant else None
+
+    # Return 'wait' on the very first neutral turn to give the judge a chance to
+    # clarify before we commit to a fallback response (FR-3).
+    if turn_number == 1 and not _llm_client:
+        return {"action": "wait",
+                "rationale": "First turn neutral message with no LLM — waiting one turn for clearer signal (FR-3)."}
 
     if _llm_client and category and merchant:
         history = "\n".join(f"{t['from_role']}: {t['message']}" for t in convo["turns"][-6:])
@@ -488,7 +608,7 @@ def compose_reply(conversation_id: str, merchant_id: Optional[str],
                     "cta": parsed.get("cta", "open_ended"),
                     "rationale": parsed.get("rationale", "LLM-composed contextual reply.")}
 
-    # Deterministic fallback for neutral turns
+    # 6. Deterministic fallback for neutral turns
     if turn_number >= 6:
         return {"action": "end", "rationale": "Conversation has run long with no clear signal; "
                                                 "exiting gracefully rather than over-nudging."}
@@ -528,11 +648,27 @@ async def metadata():
 
 
 @app.post("/v1/context")
-async def push_context(body: ContextPush):
+async def push_context(request: Request, body: ContextPush):
+    # NFR-4: reject payloads over 500 KB
+    content_length = int(request.headers.get("content-length", 0))
+    if content_length > MAX_CONTEXT_BYTES:
+        raise HTTPException(status_code=413,
+                            detail=f"Payload exceeds {MAX_CONTEXT_BYTES // 1000} KB limit")
+
     key = (body.scope, body.context_id)
     cur = CONTEXTS.get(key)
-    if cur and cur["version"] >= body.version:
-        return {"accepted": False, "reason": "stale_version", "current_version": cur["version"]}
+
+    if cur:
+        if cur["version"] == body.version:
+            # FR-1: same version is idempotent — acknowledge silently, don't overwrite
+            return {"accepted": True, "ack_id": f"ack_{body.context_id}_v{body.version}",
+                    "stored_at": datetime.now(timezone.utc).isoformat(), "note": "idempotent"}
+        if cur["version"] > body.version:
+            # FR-1: strictly older version → 409 Conflict
+            raise HTTPException(status_code=409,
+                                detail={"accepted": False, "reason": "stale_version",
+                                        "current_version": cur["version"]})
+
     CONTEXTS[key] = {"version": body.version, "payload": body.payload}
     return {"accepted": True, "ack_id": f"ack_{body.context_id}_v{body.version}",
             "stored_at": datetime.now(timezone.utc).isoformat()}
@@ -541,7 +677,14 @@ async def push_context(body: ContextPush):
 @app.post("/v1/tick")
 async def tick(body: TickRequest):
     actions = []
+    loop = asyncio.get_event_loop()
+
     for trg_id in body.available_triggers:
+        # NFR-5: hard cap at 20 actions per tick
+        if len(actions) >= MAX_TICK_ACTIONS:
+            log.warning("Reached %d-action cap; deferring remaining triggers.", MAX_TICK_ACTIONS)
+            break
+
         trigger = get_ctx("trigger", trg_id)
         if not trigger:
             continue
@@ -562,8 +705,16 @@ async def tick(body: TickRequest):
         if supp_key in SUPPRESSION_LOG:
             continue
 
+        # FR-12 + NFR-3: run compose() in a thread so it doesn't block the async event loop;
+        # enforce a hard 25s timeout (5s buffer below the judge's 30s deadline).
         try:
-            composed = compose(category, merchant, trigger, customer)
+            composed = await asyncio.wait_for(
+                loop.run_in_executor(_executor, compose, category, merchant, trigger, customer),
+                timeout=COMPOSE_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            log.warning("compose() timed out for trigger %s — skipping to avoid blocking tick.", trg_id)
+            continue
         except Exception as e:
             log.exception("compose() failed for trigger %s: %s", trg_id, e)
             continue
@@ -573,17 +724,20 @@ async def tick(body: TickRequest):
 
         SUPPRESSION_LOG[supp_key] = body.now
         conv_id = f"conv_{merchant_id}_{trg_id}"
+        is_first_send = conv_id not in CONVERSATIONS
         CONVERSATIONS.setdefault(conv_id, {"turns": [], "merchant_id": merchant_id,
                                              "customer_id": customer_id})
 
+        # C-1: first outbound message must carry template_name + template_params
+        # (WhatsApp 24h session rule); follow-ups inside an open session are free-form.
         actions.append({
             "conversation_id": conv_id,
             "merchant_id": merchant_id,
             "customer_id": customer_id,
             "send_as": composed["send_as"],
             "trigger_id": trg_id,
-            "template_name": f"vera_{trigger.get('kind', 'generic')}_v1",
-            "template_params": [merchant.get("identity", {}).get("name", "")],
+            "template_name": f"vera_{trigger.get('kind', 'generic')}_v1" if is_first_send else None,
+            "template_params": [merchant.get("identity", {}).get("name", "")] if is_first_send else [],
             "body": composed["body"],
             "cta": composed["cta"],
             "suppression_key": composed["suppression_key"],
