@@ -1,83 +1,57 @@
-# Vera-replacement bot — magicpin AI Challenge
+# Vera AI Assistant
 
-## Project Details
+A high-performance, stateless conversational agent built for the magicpin merchant network. Vera automates merchant communications, manages WhatsApp interactions, and drives merchant growth through context-aware recommendations.
 
-A single FastAPI service implementing the 5-endpoint contract (`/v1/context`, `/v1/tick`, `/v1/reply`, `/v1/healthz`, `/v1/metadata`).
+## Architecture
 
-The composer (`compose()` in `bot.py`) is one function that takes the four context layers (category, merchant, trigger, customer?) and produces a message via a large language model at `temperature=0`. It is guided by a system prompt that encodes the brief's rubric directly: specificity, category-voice fit, merchant personalization, trigger relevance, and engagement-compulsion levers.
+Vera is built as a single-binary FastAPI service exposing a stateful, robust HTTP contract.
 
-**Recent PRD Upgrades Implemented:**
-- **FR-12 & NFR-3 (Timeout & Async):** `compose()` runs asynchronously in a ThreadPoolExecutor with a hard 25-second timeout, ensuring the bot never exceeds the 30s judge limit.
-- **FR-18 (Hostile/Off-topic Handling):** Fully implemented hostile language and off-topic redirect loops.
-- **NFR-5 (Action Limits):** Hard cap of 20 actions per `/v1/tick` implemented.
-- **FR-1 (Idempotency):** Strict versioning handling on `/v1/context` (returns 200 for same version, 409 for stale version).
-- **C-1 (WhatsApp Sessions):** Enforces template matching only on the first outbound message.
+The core conversational engine (`compose()`) utilizes a deterministic multi-context pipeline. It ingests four layers of context (category, merchant, trigger, customer) and synthesizes localized, highly personalized responses using Google's Gemini LLM. The engine is tuned via a strict rubric-derived system prompt ensuring:
+- **High Specificity:** Anchoring on concrete metrics and active merchant catalogs.
+- **Brand Consistency:** Maintaining category-specific tone while respecting strict negative vocabularies.
+- **Engagement Optimization:** Utilizing behavioral levers like social proof and open-ended curiosity hooks.
 
-## Team Info
+### Core Features
+
+- **Asynchronous Composition Pipeline:** LLM synthesis is managed via a ThreadPoolExecutor with strict timeout enforcement to guarantee SLA compliance (<30s).
+- **Idempotent Context Synchronization:** The `/v1/context` ingestion endpoint ensures distributed consistency with conflict resolution (HTTP 409) for stale updates.
+- **Multi-turn State Management:** The `/v1/reply` endpoint manages conversational state, featuring zero-shot intent routing and native handling for hostile/off-topic detours.
+- **Auto-reply Detection:** Heuristic identification of merchant/customer auto-responders prevents bot-to-bot infinite loops.
+- **WhatsApp Template Compliance:** Differentiates between initial session-opening templated dispatches and subsequent free-form replies (24h rule).
+
+## Team Information
 - **Team Name:** Kavin
 - **Team Members:** Kavin Mathur
 - **Contact Email:** kavin.mathur.ug23@nsut.ac.in
 
-## Deployment
+## Production Deployment
 
-The bot is actively deployed using **Docker** on **Render's Free Tier**, powered by the **Google Gemini 2.0 Flash** API.
+The service is currently deployed as a containerized workload using Docker.
 
-- **Base Deployment URL:** `https://vera-ai-bot-obtb.onrender.com`
+- **Base URL:** `https://vera-ai-bot-obtb.onrender.com`
 - **LLM Provider:** Google Gemini (`gemini-2.0-flash`)
-- **Hosting:** Render (Docker Runtime)
+- **Runtime:** Docker / Python 3.11
 
-> **⚠️ Note on Render Free Tier:** Render spins down inactive free instances after 15 minutes. To avoid disqualification from a cold-start timeout during judging, a ping service (like UptimeRobot) should be configured to hit the `/v1/healthz` endpoint every 5 minutes during the active testing window.
+### Core Endpoints
 
-## Endpoints to Test
+| Endpoint | Method | Description |
+|---|---|---|
+| `/v1/healthz` | `GET` | Service liveness and telemetry probe. |
+| `/v1/metadata` | `GET` | System configuration and versioning data. |
+| `/v1/context` | `POST` | Ingests and versions knowledge artifacts. |
+| `/v1/tick` | `POST` | Processes scheduled triggers and initiates outbound conversations. |
+| `/v1/reply` | `POST` | Handles inbound webhooks for active multi-turn sessions. |
 
-You can verify the active deployment using the following endpoints. 
+## Local Development
 
-**GET Endpoints (Clickable in browser):**
-1. **Health Check:** [https://vera-ai-bot-obtb.onrender.com/v1/healthz](https://vera-ai-bot-obtb.onrender.com/v1/healthz)
-   - *Expected:* `{"status": "ok", "uptime_seconds": ... }`
-2. **Metadata:** [https://vera-ai-bot-obtb.onrender.com/v1/metadata](https://vera-ai-bot-obtb.onrender.com/v1/metadata)
-   - *Expected:* JSON containing the Team Name, Members, and Bot Version (`0.2.0`).
+The service is designed to be provider-agnostic. All secrets and provider configurations are injected via the environment.
 
-**POST Endpoints (Requires curl or Postman):**
-
-3. **Push Context (`/v1/context`)**
-```bash
-curl -X POST https://vera-ai-bot-obtb.onrender.com/v1/context \
--H "Content-Type: application/json" \
--d '{
-  "scope": "merchant",
-  "context_id": "merch_123",
-  "version": 1,
-  "payload": {"identity": {"name": "Test Salon"}},
-  "delivered_at": "2026-09-26T10:00:00Z"
-}'
-```
-
-4. **Tick (`/v1/tick`)**
-```bash
-curl -X POST https://vera-ai-bot-obtb.onrender.com/v1/tick \
--H "Content-Type: application/json" \
--d '{
-  "now": "2026-09-26T10:00:00Z",
-  "available_triggers": []
-}'
-```
-
-## Running Locally
-
-No LLM provider name is hardcoded anywhere in `bot.py` — all provider specifics are supplied via environment variables.
-
-1. Ensure you have your `.env` file configured with your Gemini API key (see `.env` for the template, this file is intentionally git-ignored).
+1. Configure `.env` with valid LLM credentials (see `.env.example` if applicable).
 2. Install dependencies:
    ```bash
    pip install -r requirements.txt
    ```
-3. Run the FastAPI server:
+3. Initialize the server:
    ```bash
    uvicorn bot:app --host 0.0.0.0 --port 8080
-   ```
-4. Run the provided simulator from the challenge root:
-   ```bash
-   export BOT_URL=http://localhost:8080
-   python judge_simulator.py
    ```
