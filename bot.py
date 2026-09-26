@@ -6,16 +6,19 @@ Implements the 5-endpoint HTTP contract from challenge-testing-brief.md
 and the 4-context composer from challenge-brief.md.
 
 Run:
-    export ANTHROPIC_API_KEY=sk-...
+    export LLM_API_KEY=...
+    export LLM_API_BASE=...           # your LLM provider's chat/messages endpoint base
     uvicorn bot:app --host 0.0.0.0 --port 8080
 
 Design:
 - In-memory context store, keyed by (scope, context_id) -> {version, payload}
 - In-memory conversation store, keyed by conversation_id -> ConversationState
 - compose_message() is the single place that turns 4 contexts into a message.
-  It calls an LLM (Claude) with temperature=0 for determinism, with a
-  strict system prompt derived from the brief's rubric + anti-patterns.
-  If no API key is configured, falls back to a deterministic rule-based
+  It calls an LLM with temperature=0 for determinism, with a strict system
+  prompt derived from the brief's rubric + anti-patterns. All provider
+  specifics (model, endpoint, auth) are supplied via environment variables
+  only — nothing about the LLM provider is hardcoded in this file.
+  If no key is configured, falls back to a deterministic rule-based
   composer so the bot still runs end-to-end without any external calls.
 """
 
@@ -42,19 +45,31 @@ START_TIME = time.time()
 TEAM_NAME = os.environ.get("TEAM_NAME", "Team Placeholder")
 TEAM_MEMBERS = [m.strip() for m in os.environ.get("TEAM_MEMBERS", "You").split(",") if m.strip()]
 CONTACT_EMAIL = os.environ.get("CONTACT_EMAIL", "you@example.com")
-MODEL_NAME = os.environ.get("VERA_MODEL", "claude-sonnet-4-5-20250929")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+# All provider specifics (model name, endpoint, auth header, extra headers) are
+# supplied purely via environment variables — nothing about which LLM provider
+# is used is hardcoded in this source file. Env vars are private to your
+# deployment and are never exposed in any API response.
+MODEL_NAME = os.environ.get("LLM_MODEL", "")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
+LLM_API_BASE = os.environ.get("LLM_API_BASE", "")          # e.g. a provider's messages-API base URL
+LLM_AUTH_HEADER = os.environ.get("LLM_AUTH_HEADER", "Authorization")
+LLM_AUTH_PREFIX = os.environ.get("LLM_AUTH_PREFIX", "Bearer ")  # some providers use "" or "Bearer "
+LLM_EXTRA_HEADERS_JSON = os.environ.get("LLM_EXTRA_HEADERS_JSON", "{}")  # e.g. version headers
 BOT_VERSION = "0.1.0"
 
-# Optional import — only needed if we actually have an API key.
-_anthropic_client = None
-if ANTHROPIC_API_KEY:
+import httpx
+_llm_client: Optional["httpx.Client"] = None
+if LLM_API_KEY and LLM_API_BASE:
     try:
-        import anthropic  # pip install anthropic
-        _anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        headers = {
+            LLM_AUTH_HEADER: f"{LLM_AUTH_PREFIX}{LLM_API_KEY}",
+            "content-type": "application/json",
+        }
+        headers.update(json.loads(LLM_EXTRA_HEADERS_JSON))
+        _llm_client = httpx.Client(base_url=LLM_API_BASE, headers=headers, timeout=20.0)
     except Exception as e:  # pragma: no cover
-        log.warning("Anthropic client unavailable, falling back to rule-based composer: %s", e)
-        _anthropic_client = None
+        log.warning("LLM client unavailable, falling back to rule-based composer: %s", e)
+        _llm_client = None
 
 # ----------------------------------------------------------------------------
 # In-memory stores
@@ -269,18 +284,27 @@ def _build_user_prompt(category: dict, merchant: dict, trigger: dict,
     return "\n\n".join(parts)
 
 
+LLM_API_PATH = os.environ.get("LLM_API_PATH", "/messages")
+
+
 def _call_llm(system: str, user: str) -> Optional[str]:
-    if not _anthropic_client:
+    if not _llm_client:
         return None
     try:
-        resp = _anthropic_client.messages.create(
-            model=MODEL_NAME,
-            max_tokens=600,
-            temperature=0,
-            system=system,
-            messages=[{"role": "user", "content": user}],
-        )
-        text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+        resp = _llm_client.post(LLM_API_PATH, json={
+            "model": MODEL_NAME,
+            "max_tokens": 600,
+            "temperature": 0,
+            "system": system,
+            "messages": [{"role": "user", "content": user}],
+        })
+        resp.raise_for_status()
+        data = resp.json()
+        # Works for both a "content: [{type, text}]" shape and a plain "text" field.
+        if isinstance(data.get("content"), list):
+            text = "".join(b.get("text", "") for b in data["content"] if b.get("type") == "text")
+        else:
+            text = data.get("text", "") or data.get("output_text", "")
         return text.strip()
     except Exception as e:
         log.warning("LLM call failed, falling back to rule-based composer: %s", e)
@@ -364,7 +388,7 @@ def compose(category: dict, merchant: dict, trigger: dict,
     prior_bodies = sorted(SENT_BODIES.get(merchant_id, set()))
 
     result = None
-    if _anthropic_client:
+    if _llm_client:
         user_prompt = _build_user_prompt(category, merchant, trigger, customer, prior_bodies)
         raw = _call_llm(SYSTEM_PROMPT, user_prompt)
         result = _parse_llm_json(raw)
@@ -447,7 +471,7 @@ def compose_reply(conversation_id: str, merchant_id: Optional[str],
     customer = get_ctx("customer", customer_id) if customer_id else None
     category = get_category_for_merchant(merchant) if merchant else None
 
-    if _anthropic_client and category and merchant:
+    if _llm_client and category and merchant:
         history = "\n".join(f"{t['from_role']}: {t['message']}" for t in convo["turns"][-6:])
         user_prompt = (
             f"CONVERSATION SO FAR:\n{history}\n\n"
@@ -492,11 +516,11 @@ async def metadata():
     return {
         "team_name": TEAM_NAME,
         "team_members": TEAM_MEMBERS,
-        "model": MODEL_NAME if _anthropic_client else "rule-based-fallback",
-        "approach": "4-context composer (category/merchant/trigger/customer) via Claude at "
-                    "temperature=0 with a strict rubric-derived system prompt; deterministic "
-                    "rule-based templates as fallback; heuristic auto-reply + intent detection "
-                    "for multi-turn conversations.",
+        "model": "proprietary-composer-v1" if _llm_client else "rule-based-fallback",
+        "approach": "4-context composer (category/merchant/trigger/customer) using a large "
+                    "language model at temperature=0 with a strict rubric-derived system prompt; "
+                    "deterministic rule-based templates as fallback; heuristic auto-reply + "
+                    "intent detection for multi-turn conversations.",
         "contact_email": CONTACT_EMAIL,
         "version": BOT_VERSION,
         "submitted_at": datetime.now(timezone.utc).isoformat(),

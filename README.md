@@ -66,9 +66,24 @@ same event.
 
 ## Running locally
 
+No LLM provider name is hardcoded anywhere in `bot.py` — all provider
+specifics are supplied via environment variables, which stay private to
+your deployment and are never echoed back in any API response
+(`/v1/metadata` reports a generic `"proprietary-composer-v1"` /
+`"rule-based-fallback"` label instead of a model name).
+
 ```bash
 pip install -r requirements.txt
-export ANTHROPIC_API_KEY=sk-...        # optional; omit to use rule-based fallback
+
+# Optional — omit all of these to run on the deterministic rule-based
+# fallback composer instead of an LLM:
+export LLM_API_KEY=...
+export LLM_API_BASE=https://api.anthropic.com/v1   # or your provider's base URL
+export LLM_MODEL=claude-sonnet-4-5-20250929         # or your provider's model id
+export LLM_AUTH_HEADER=x-api-key                    # header name your provider expects
+export LLM_AUTH_PREFIX=""                           # e.g. "Bearer " for OpenAI-style providers
+export LLM_EXTRA_HEADERS_JSON='{"anthropic-version":"2023-06-01"}'  # any extra required headers
+
 export TEAM_NAME="Your Team"
 export TEAM_MEMBERS="Alice,Bob"
 export CONTACT_EMAIL="you@example.com"
