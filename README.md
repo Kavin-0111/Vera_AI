@@ -6,6 +6,20 @@ A high-performance, stateless conversational agent built for the magicpin mercha
 
 Vera is built as a single-binary FastAPI service exposing a stateful, robust HTTP contract.
 
+```mermaid
+graph TD
+    A[magicpin Judge/Webhook] -->|HTTP POST| B(FastAPI Server)
+    B -->|Context/Triggers| C{In-Memory State Store}
+    B -->|Active Conversations| C
+    B --> D[Compose Engine]
+    C -->|Hydrate Context| D
+    D -->|System Prompt + Payload| E[Google Gemini 2.0 Flash]
+    E -->|JSON Response| D
+    D -->|Action: Send/Wait/End| B
+    B -->|JSON Response| A
+```
+
+
 The core conversational engine (`compose()`) utilizes a deterministic multi-context pipeline. It ingests four layers of context (category, merchant, trigger, customer) and synthesizes localized, highly personalized responses using Google's Gemini LLM. The engine is tuned via a strict rubric-derived system prompt ensuring:
 - **High Specificity:** Anchoring on concrete metrics and active merchant catalogs.
 - **Brand Consistency:** Maintaining category-specific tone while respecting strict negative vocabularies.
@@ -44,6 +58,12 @@ The service is currently deployed as a containerized workload using Docker.
 
 ## Local Development
 
+### Prerequisites
+- Python 3.11+
+- Docker (optional, for containerized deployment)
+- Google Gemini API Key (get one free at [Google AI Studio](https://aistudio.google.com/apikey))
+
+### Setup
 The service is designed to be provider-agnostic. All secrets and provider configurations are injected via the environment.
 
 1. Configure `.env` with valid LLM credentials (see `.env.example` if applicable).
@@ -55,3 +75,15 @@ The service is designed to be provider-agnostic. All secrets and provider config
    ```bash
    uvicorn bot:app --host 0.0.0.0 --port 8080
    ```
+
+### Local Testing (Simulator)
+To test the bot locally using the challenge's provided `judge_simulator.py`:
+
+1. Ensure the FastAPI server is running in one terminal window.
+2. In a second terminal window, navigate to the challenge root directory.
+3. Export the target URL and run the simulator:
+   ```bash
+   export BOT_URL=http://localhost:8080
+   python judge_simulator.py
+   ```
+
